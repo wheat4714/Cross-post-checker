@@ -1,0 +1,169 @@
+import requests
+import json
+import re
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+
+# Sample config
+#RADARR_URL = "http://your-radarr-url:7878/api/v3"
+#RADARR_API_KEY = "your-radarr-api-key"
+#HAWKE_API_URL = "https://hawke.uno/api"
+#HAWKE_API_KEY = "your-hawke-api-key"
+
+CACHE_DB = 'cache.db'
+CACHE_EXPIRY_DAYS = 7
+
+# Setup logging
+logging.basicConfig(filename='error_log.txt', level=logging.ERROR)
+
+# Setup SQLite cache
+def init_db():
+    conn = sqlite3.connect(CACHE_DB)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS hawke_cache (
+                        imdb_id TEXT PRIMARY KEY,
+                        data TEXT,
+                        last_checked TIMESTAMP
+                    )''')
+    conn.commit()
+    conn.close()
+
+# Cache functions
+def get_cache(imdb_id):
+    conn = sqlite3.connect(CACHE_DB)
+    cursor = conn.cursor()
+    cursor.execute('''SELECT data, last_checked FROM hawke_cache WHERE imdb_id=?''', (imdb_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        data, last_checked = row
+        if datetime.strptime(last_checked, '%Y-%m-%d %H:%M:%S') >= datetime.now() - timedelta(days=CACHE_EXPIRY_DAYS):
+            return json.loads(data)
+    return None
+
+def set_cache(imdb_id, data):
+    conn = sqlite3.connect(CACHE_DB)
+    cursor = conn.cursor()
+    cursor.execute('''INSERT OR REPLACE INTO hawke_cache (imdb_id, data, last_checked) 
+                      VALUES (?, ?, ?)''', (imdb_id, json.dumps(data), datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+def get_radarr_movies():
+    print("Fetching movies from Radarr...")
+    url = f"{RADARR_URL}/movie"
+    headers = {"X-Api-Key": RADARR_API_KEY}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    movies = response.json()
+    print(f"Found {len(movies)} movies in Radarr.")
+    return movies
+
+def search_hawke(imdb_id):
+    cached_result = get_cache(imdb_id)
+    if cached_result:
+        print(f"  Using cached result for IMDB ID: {imdb_id}")
+        return cached_result
+
+    print(f"  Fetching new result from Hawke.one for IMDB ID: {imdb_id}")
+    url = f"{HAWKE_API_URL}/torrents?api_token={HAWKE_API_KEY}&imdb={imdb_id}&resolution_id=2"
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+
+    set_cache(imdb_id, data)
+    return data
+
+def extract_release_group(file_name):
+    match = re.search(r'-(\w+)(?:\.mkv|\.mp4|\.avi)?$', file_name)
+    return match.group(1) if match else None
+
+def get_movie_history(movie_id):
+    url = f"{RADARR_URL}/history/movie"
+    params = {"movieId": movie_id}
+    headers = {"X-Api-Key": RADARR_API_KEY}
+    response = requests.get(url, params=params, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+def check_movies():
+    radarr_movies = get_radarr_movies()
+    movies_not_found_list = []
+    total_movies = len(radarr_movies)
+    movies_checked = 0
+    movies_not_found = 0
+
+    for movie in radarr_movies:
+        movies_checked += 1
+        print(f"Checking movie {movies_checked}/{total_movies}: {movie['title']} ({movie['year']})")
+
+        if not movie['hasFile']:
+            print("  No file available for this movie. Skipping.")
+            continue
+
+        file_info = movie['movieFile']
+
+        # Remove Usenet filtering code
+        if file_info['quality']['quality']['resolution'] != 2160:
+            print("  Not a 2160p release. Skipping.")
+            continue
+
+        local_release_group = extract_release_group(file_info['relativePath'])
+        if local_release_group is None:
+            print("  No release group found. Skipping.")
+            continue
+
+        if local_release_group.lower() not in ['bhdstudio', 'hallowed']:
+            print(f"  Release group is not BHDStudio or Hallowed (found {local_release_group}). Skipping.")
+            continue
+
+        imdb_id = movie['imdbId']
+        try:
+            hawke_results = search_hawke(imdb_id)
+            
+            if not hawke_results.get('data'):
+                print(f"  Not found on Hawke.one: {movie['title']} ({movie['year']}) - {local_release_group}")
+                movies_not_found_list.append(f"{movie['title']} ({movie['year']}) - {local_release_group}")
+                movies_not_found += 1
+            else:
+                # Check each torrent in the result for the correct release group and resolution
+                found = False
+                for torrent in hawke_results['data']:
+                    if torrent.get('resolution') == '2160p' and any(group in torrent.get('releaseName', '').lower() for group in ['bhdstudio', 'hallowed']):
+                        found = True
+                        break
+                
+                if not found:
+                    print(f"  No matching 2160p release found on Hawke.one: {movie['title']} ({movie['year']}) - {local_release_group}")
+                    movies_not_found_list.append(f"{movie['title']} ({movie['year']}) - {local_release_group}")
+                    movies_not_found += 1
+
+        except Exception as e:
+            logging.error(f"Error processing movie {movie['title']} ({movie['year']}): {str(e)}")
+            print(f"  Error occurred, logged to error_log.txt")
+
+    print(f"\nSummary:")
+    print(f"Checked {movies_checked} movies")
+    print(f"Movies not found on Hawke.one: {movies_not_found}")
+    
+    return sorted(movies_not_found_list)
+
+def save_to_txt(movies_list, filename="movies_not_found.txt"):
+    with open(filename, 'w') as file:
+        for movie in movies_list:
+            file.write(f"{movie}\n")
+    print(f"\nResults saved to {filename}")
+
+# Main execution
+if __name__ == "__main__":
+    print("Starting Radarr to Hawke.one checker...")
+    init_db()
+    movies_not_found_list = check_movies()
+    
+    if movies_not_found_list:
+        save_to_txt(movies_not_found_list)
+    else:
+        print("All movies with BHDStudio or Hallowed 2160p releases are found on Hawke.one.")
+
+    print("Check complete.")
